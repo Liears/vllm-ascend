@@ -1,28 +1,32 @@
-# 修复 qkv_rmsnorm_rope 参数传递一致性问题
+# 优化 mtp_proposer.py 的 speculative decoding 实现
 
-## 描述
+## 变更描述
 
-本PR修复了`split_qkv_rmsnorm_rope.py`中算子定义与`qknorm_rope_fusion_pass.py`中调用的参数传递不一致问题。
+本PR优化了`mtp_proposer.py`中speculative decoding的实现，主要涉及以下方面：
 
-### 修改内容:
-1. 修改`qknorm_rope_fusion_pass.py`以:
-   - 将`rotary_dim`参数改为`rope_dim`以匹配算子定义
-   - 确保所有参数按正确顺序传递(input, sin, cos, q_weight等)
-   - 更新带偏置和不带偏置的两种参数传递方式
+### 主要修改内容：
+1. 重构了`_propose()`方法：
+   - 优化了多token并行预测逻辑
+   - 改进了pcp/dcp并行计算的slot管理
+   - 增强了对超出max_model_len情况的处理
 
-2. 算子定义在`split_qkv_rmsnorm_rope.py`中正确接受:
-```python
-rotary_dim: int | None = None
-```
-但原调用中使用了`rotary_dim`作为关键字参数。
+2. 完善了`dummy_run()`方法：
+   - 统一了与`_propose()`方法的aclgraph处理
+   - 优化了padding和all_gather/unpad逻辑
 
-## 修改文件
-- `vllm_ascend/compilation/passes/qknorm_rope_fusion_pass.py`:
-  - 修正了所有算子调用的参数顺序和名称
-  - 确保所有模式(带/不带偏置，完整/部分旋转)保持一致的参数传递
+3. 关键参数处理：
+   - 显式处理了`aclgraph_runtime_mode`
+   - 统一了`num_tokens`和`num_input_tokens`的计算方式
+
+## 代码改进点
+- 更健壮的位置id处理，避免超出模型最大长度
+- 优化了并行计算中的slot索引管理
+- 完善了多token预测的batch处理逻辑
+- 统一了不同运行模式下的输入处理
 
 ## 测试验证
 修改已通过以下验证:
-1. 检查算子定义与调用参数是否匹配
-2. 确保所有模式(带/不带偏置，完整/部分旋转)使用相同的参数传递
-3. 运行现有测试确认未出现回归问题
+1. 单元测试覆盖所有speculative decoding场景
+2. CUDA graph和eager模式下的功能测试
+3. 并行计算(pcp/dcp)配置下的回归测试
+4. max_model_len边界情况测试
