@@ -44,7 +44,9 @@ def split_qkv_rmsnorm_rope_kernel(
     KV_BLOCK_SIZE: tl.constexpr,
     BIAS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
-    HALF_HEAD_DIM: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    HALF_ROPE_DIM: tl.constexpr,
+    IS_PARTIAL_ROPE: tl.constexpr,
 ):
     row_pid = tl.program_id(0)
     col_pid = tl.program_id(1)
@@ -74,42 +76,90 @@ def split_qkv_rmsnorm_rope_kernel(
         else:
             normalized_values = (normalized_values * weight_values).to(tl.bfloat16)
 
-        sc_offsets = row_idx * HEAD_DIM + tl.arange(0, HEAD_DIM)
-        sin = (tl.load(sin_ptr + sc_offsets)).reshape(1, HEAD_DIM)
-        cos = (tl.load(cos_ptr + sc_offsets)).reshape(1, HEAD_DIM)
-        x1 = tl.extract_slice(
-            normalized_values,
-            offsets=(0, 0),
-            sizes=(Q_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM),
-            strides=(1, 1),
-        )
-        x2 = tl.extract_slice(
-            normalized_values,
-            offsets=(0, HALF_HEAD_DIM),
-            sizes=(Q_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM),
-            strides=(1, 1),
-        )
-        cat_x = tl.zeros((Q_BLOCK_SIZE // HEAD_DIM, HEAD_DIM), dtype=tl.bfloat16)
-        cat_x = tl.insert_slice(
-            cat_x,
-            -x2,
-            offsets=(0, 0),
-            sizes=(Q_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM),
-            strides=(1, 1),
-        )
-        cat_x = tl.insert_slice(
-            cat_x,
-            x1,
-            offsets=(0, HALF_HEAD_DIM),
-            sizes=(Q_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM),
-            strides=(1, 1),
-        )
-        roped_q = cat_x * sin + normalized_values * cos
-        tl.store(
-            q_ptr + output_offset + col_indices,
-            roped_q.reshape(Q_BLOCK_SIZE).to(q_ptr.dtype.element_ty),
-            mask=valid_mask,
-        )
+        sc_offsets = row_idx * ROPE_DIM + tl.arange(0, ROPE_DIM)
+        sin = (tl.load(sin_ptr + sc_offsets)).reshape(1, ROPE_DIM)
+        cos = (tl.load(cos_ptr + sc_offsets)).reshape(1, ROPE_DIM)
+        if IS_PARTIAL_ROPE:  # ROPE_DIM < HEAD_DIM
+            x1 = tl.extract_slice(
+                normalized_values,
+                offsets=(0, 0),
+                sizes=(Q_BLOCK_SIZE // HEAD_DIM, HALF_ROPE_DIM),
+                strides=(1, 1),
+            )
+            x2 = tl.extract_slice(
+                normalized_values,
+                offsets=(0, HALF_ROPE_DIM),
+                sizes=(Q_BLOCK_SIZE // HEAD_DIM, HALF_ROPE_DIM),
+                strides=(1, 1),
+            )
+            cat_x = tl.zeros((Q_BLOCK_SIZE // HEAD_DIM, ROPE_DIM), dtype=tl.bfloat16)
+            cat_x = tl.insert_slice(
+                cat_x,
+                -x2,
+                offsets=(0, 0),
+                sizes=(Q_BLOCK_SIZE // HEAD_DIM, HALF_ROPE_DIM),
+                strides=(1, 1),
+            )
+            cat_x = tl.insert_slice(
+                cat_x,
+                x1,
+                offsets=(0, HALF_ROPE_DIM),
+                sizes=(Q_BLOCK_SIZE // HEAD_DIM, HALF_ROPE_DIM),
+                strides=(1, 1),
+            )
+            orig_x = tl.extract_slice(
+                normalized_values,
+                offsets=(0, 0),
+                sizes=(Q_BLOCK_SIZE // HEAD_DIM, ROPE_DIM),
+                strides=(1, 1),
+            )
+            roped_q = cat_x * sin + orig_x * cos
+            normalized_values = tl.insert_slice(
+                normalized_values,
+                roped_q,
+                offsets=(0, 0),
+                sizes=(Q_BLOCK_SIZE // HEAD_DIM, ROPE_DIM),
+                strides=(1, 1),
+            )
+            tl.store(
+                q_ptr + output_offset + col_indices,
+                normalized_values.reshape(Q_BLOCK_SIZE).to(q_ptr.dtype.element_ty),
+                mask=valid_mask,
+            )
+        else:  # ROPE_DIM = HEAD_DIM
+            x1 = tl.extract_slice(
+                normalized_values,
+                offsets=(0, 0),
+                sizes=(Q_BLOCK_SIZE // HEAD_DIM, HALF_ROPE_DIM),
+                strides=(1, 1),
+            )
+            x2 = tl.extract_slice(
+                normalized_values,
+                offsets=(0, HALF_ROPE_DIM),
+                sizes=(Q_BLOCK_SIZE // HEAD_DIM, HALF_ROPE_DIM),
+                strides=(1, 1),
+            )
+            cat_x = tl.zeros((Q_BLOCK_SIZE // HEAD_DIM, HEAD_DIM), dtype=tl.bfloat16)
+            cat_x = tl.insert_slice(
+                cat_x,
+                -x2,
+                offsets=(0, 0),
+                sizes=(Q_BLOCK_SIZE // HEAD_DIM, HALF_ROPE_DIM),
+                strides=(1, 1),
+            )
+            cat_x = tl.insert_slice(
+                cat_x,
+                x1,
+                offsets=(0, HALF_ROPE_DIM),
+                sizes=(Q_BLOCK_SIZE // HEAD_DIM, HALF_ROPE_DIM),
+                strides=(1, 1),
+            )
+            roped_q = cat_x * sin + normalized_values * cos
+            tl.store(
+                q_ptr + output_offset + col_indices,
+                roped_q.reshape(Q_BLOCK_SIZE).to(q_ptr.dtype.element_ty),
+                mask=valid_mask,
+            )
         input_offset += input_offset_step
         output_offset += output_offset_step
 
@@ -135,43 +185,91 @@ def split_qkv_rmsnorm_rope_kernel(
             normalized_values = (normalized_values * weight_values + bias_values).to(tl.bfloat16)
         else:
             normalized_values = (normalized_values * weight_values).to(tl.bfloat16)
-        sc_offsets = row_idx * HEAD_DIM + tl.arange(0, HEAD_DIM)
-        sin = (tl.load(sin_ptr + sc_offsets)).reshape(1, HEAD_DIM)
-        cos = (tl.load(cos_ptr + sc_offsets)).reshape(1, HEAD_DIM)
-        x1 = tl.extract_slice(
-            normalized_values,
-            offsets=(0, 0),
-            sizes=(KV_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM),
-            strides=(1, 1),
-        )
-        x2 = tl.extract_slice(
-            normalized_values,
-            offsets=(0, HALF_HEAD_DIM),
-            sizes=(KV_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM),
-            strides=(1, 1),
-        )
-        cat_x = tl.zeros((KV_BLOCK_SIZE // HEAD_DIM, HEAD_DIM), dtype=tl.bfloat16)
-        cat_x = tl.insert_slice(
-            cat_x,
-            -x2,
-            offsets=(0, 0),
-            sizes=(KV_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM),
-            strides=(1, 1),
-        )
-        cat_x = tl.insert_slice(
-            cat_x,
-            x1,
-            offsets=(0, HALF_HEAD_DIM),
-            sizes=(KV_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM),
-            strides=(1, 1),
-        )
-        roped_k = cat_x * sin + normalized_values * cos
+        sc_offsets = row_idx * ROPE_DIM + tl.arange(0, ROPE_DIM)
+        sin = (tl.load(sin_ptr + sc_offsets)).reshape(1, ROPE_DIM)
+        cos = (tl.load(cos_ptr + sc_offsets)).reshape(1, ROPE_DIM)
+        if IS_PARTIAL_ROPE:  # ROPE_DIM < HEAD_DIM:
+            x1 = tl.extract_slice(
+                normalized_values,
+                offsets=(0, 0),
+                sizes=(KV_BLOCK_SIZE // HEAD_DIM, HALF_ROPE_DIM),
+                strides=(1, 1),
+            )
+            x2 = tl.extract_slice(
+                normalized_values,
+                offsets=(0, HALF_ROPE_DIM),
+                sizes=(KV_BLOCK_SIZE // HEAD_DIM, HALF_ROPE_DIM),
+                strides=(1, 1),
+            )
+            cat_x = tl.zeros((KV_BLOCK_SIZE // HEAD_DIM, ROPE_DIM), dtype=tl.bfloat16)
+            cat_x = tl.insert_slice(
+                cat_x,
+                -x2,
+                offsets=(0, 0),
+                sizes=(KV_BLOCK_SIZE // HEAD_DIM, HALF_ROPE_DIM),
+                strides=(1, 1),
+            )
+            cat_x = tl.insert_slice(
+                cat_x,
+                x1,
+                offsets=(0, HALF_ROPE_DIM),
+                sizes=(KV_BLOCK_SIZE // HEAD_DIM, HALF_ROPE_DIM),
+                strides=(1, 1),
+            )
+            orig_x = tl.extract_slice(
+                normalized_values,
+                offsets=(0, 0),
+                sizes=(KV_BLOCK_SIZE // HEAD_DIM, ROPE_DIM),
+                strides=(1, 1),
+            )
+            roped_k = cat_x * sin + orig_x * cos
+            normalized_values = tl.insert_slice(
+                normalized_values,
+                roped_k,
+                offsets=(0, 0),
+                sizes=(KV_BLOCK_SIZE // HEAD_DIM, ROPE_DIM),
+                strides=(1, 1),
+            )
+            tl.store(
+                k_ptr + output_offset + col_indices,
+                normalized_values.reshape(KV_BLOCK_SIZE).to(k_ptr.dtype.element_ty),
+                mask=valid_mask,
+            )
+        else:  # ROPE_DIM = HEAD_DIM
+            x1 = tl.extract_slice(
+                normalized_values,
+                offsets=(0, 0),
+                sizes=(KV_BLOCK_SIZE // HEAD_DIM, HALF_ROPE_DIM),
+                strides=(1, 1),
+            )
+            x2 = tl.extract_slice(
+                normalized_values,
+                offsets=(0, HALF_ROPE_DIM),
+                sizes=(KV_BLOCK_SIZE // HEAD_DIM, HALF_ROPE_DIM),
+                strides=(1, 1),
+            )
+            cat_x = tl.zeros((KV_BLOCK_SIZE // HEAD_DIM, HEAD_DIM), dtype=tl.bfloat16)
+            cat_x = tl.insert_slice(
+                cat_x,
+                -x2,
+                offsets=(0, 0),
+                sizes=(KV_BLOCK_SIZE // HEAD_DIM, HALF_ROPE_DIM),
+                strides=(1, 1),
+            )
+            cat_x = tl.insert_slice(
+                cat_x,
+                x1,
+                offsets=(0, HALF_ROPE_DIM),
+                sizes=(KV_BLOCK_SIZE // HEAD_DIM, HALF_ROPE_DIM),
+                strides=(1, 1),
+            )
+            roped_k = cat_x * sin + normalized_values * cos
 
-        tl.store(
-            k_ptr + output_offset + col_indices,
-            roped_k.to(tl.bfloat16).reshape(KV_BLOCK_SIZE),
-            mask=valid_mask,
-        )
+            tl.store(
+                k_ptr + output_offset + col_indices,
+                roped_k.to(tl.bfloat16).reshape(KV_BLOCK_SIZE),
+                mask=valid_mask,
+            )
         input_offset += input_offset_step
         output_offset += output_offset_step
 
@@ -196,6 +294,7 @@ def split_qkv_rmsnorm_rope_impl(
     kv_hidden_size: int,
     head_dim: int,
     eps: float,
+    rotary_dim: int | None = None,
     q_bias: torch.Tensor | None = None,
     k_bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -213,6 +312,8 @@ def split_qkv_rmsnorm_rope_impl(
     assert num_vectorcore % n_cols == 0
     n_rows = num_vectorcore // n_cols
     BIAS = q_bias is not None
+    if rotary_dim is None:
+        rotary_dim = head_dim
 
     split_qkv_rmsnorm_rope_kernel[(n_rows, n_cols, 1)](
         input,
@@ -234,7 +335,9 @@ def split_qkv_rmsnorm_rope_impl(
         KV_BLOCK_SIZE,
         BIAS,
         head_dim,
-        head_dim // 2,
+        rotary_dim,
+        rotary_dim // 2,
+        rotary_dim != head_dim,
     )
     return q_output, k_output, v_output
 
@@ -249,6 +352,7 @@ def split_qkv_rmsnorm_rope_impl_fake(
     kv_hidden_size: int,
     head_dim: int,
     eps: float,
+    rotary_dim: int | None = None,
     q_bias: torch.Tensor | None = None,
     k_bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
